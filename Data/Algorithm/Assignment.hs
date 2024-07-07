@@ -13,18 +13,20 @@ module Data.Algorithm.Assignment
   )
 where
 
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, void, when)
 import Control.Monad.Fix (fix)
 import Control.Monad.ST (ST, runST)
 import Data.Array (Array)
 import Data.Array.Base qualified as A
 import Data.Array.ST (STUArray)
 import Data.Array.ST qualified as ST
-import Data.Function (on)
-import Data.List qualified
-import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (mapMaybe)
-import Data.STRef (modifySTRef', newSTRef, readSTRef)
+import Data.STRef (modifySTRef', newSTRef, readSTRef, writeSTRef)
+
+type CostMatrix s = STUArray s (Int, Int) Int
+
+type MarkMatrix s = STUArray s (Int, Int) Char
+
+type CoverageVector s = STUArray s Int Bool
 
 -- | \(\mathcal{O}(n^4)\). Assign elements from two collections to each
 -- other so that the total cost is minimal. The cost of each combination is
@@ -55,30 +57,35 @@ assign cost as bs = runST $ do
       abMaxBound = max aMaxBound bMaxBound
       asArray = A.listArray (aMinBound, aMaxBound) as
       bsArray = A.listArray (bMinBound, bMaxBound) bs
-  c <- ST.newArray ((aMinBound, bMinBound), (abMaxBound, abMaxBound)) 0
+      matrixBounds = ((aMinBound, bMinBound), (abMaxBound, abMaxBound))
+  c <- ST.newArray matrixBounds 0
+  m <- ST.newArray matrixBounds noMark
+  aCoverage <- ST.newArray (aMinBound, abMaxBound) False
+  bCoverage <- ST.newArray (bMinBound, abMaxBound) False
   countFromTo aMinBound aMaxBound $ \i ->
     countFromTo bMinBound bMaxBound $ \j ->
       ST.writeArray c (i, j) (cost (asArray A.! i) (bsArray A.! j))
-  let (normalization, assignment) =
-        if aMaxBound - aMinBound >= bMaxBound - bMinBound
-          then (normalizePerB, assignPerB)
-          else (normalizePerA, assignPerA)
-  normalization c
-  r0 <- assignment c
-  indicesToElems asArray bsArray <$> case r0 of
-    Nothing ->
-      fix $ \recurse -> do
-        rearrange c
-        r1 <- assignment c
-        maybe recurse return r1
-    Just is -> return is
+  if aMaxBound - aMinBound >= bMaxBound - bMinBound
+    then normalizePerB c
+    else normalizePerA c
+  starZeros c m aCoverage bCoverage
+  fix $ \recurse0 -> do
+    done <- coverZeros m aCoverage bCoverage
+    if done
+      then recoverResults m asArray bsArray
+      else fix $ \recurse1 -> do
+        r <- primeUncoveredZero c m aCoverage bCoverage
+        case r of
+          Nothing -> do
+            adjustCosts c aCoverage bCoverage
+            recurse1
+          Just z0 -> do
+            adjustMarks m z0
+            clearCoverage aCoverage bCoverage
+            recurse0
 {-# INLINEABLE assign #-}
 
--- | Normalize the matrix by finding the minimal element from the second
--- collection (B) that corresponds to a given element from the first
--- collection (A) and subtracting it from all elements that correspond to
--- that given element from A.
-normalizePerA :: STUArray s (Int, Int) Int -> ST s ()
+normalizePerA :: CostMatrix s -> ST s ()
 normalizePerA c = do
   ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds c
   countFromTo aMinBound aMaxBound $ \i -> do
@@ -89,13 +96,9 @@ normalizePerA c = do
     when (minValue /= 0) $ do
       countFromTo bMinBound bMaxBound $ \j -> do
         ST.modifyArray' c (i, j) (subtract minValue)
-{-# INLINEABLE normalizePerA #-}
+{-# INLINE normalizePerA #-}
 
--- | Normalize the matrix by finding the minimal element from the first
--- collection (A) that corresponds to a given element from the second
--- collection (B) and subtracting it from all elements that correspond to
--- that given element from B.
-normalizePerB :: STUArray s (Int, Int) Int -> ST s ()
+normalizePerB :: CostMatrix s -> ST s ()
 normalizePerB c = do
   ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds c
   countFromTo bMinBound bMaxBound $ \j -> do
@@ -106,142 +109,198 @@ normalizePerB c = do
     when (minValue /= 0) $ do
       countFromTo aMinBound aMaxBound $ \i -> do
         ST.modifyArray' c (i, j) (subtract minValue)
-{-# INLINEABLE normalizePerB #-}
+{-# INLINE normalizePerB #-}
 
--- | Rearrange the given matrix so as get closer to a successful assignment.
-rearrange :: STUArray s (Int, Int) Int -> ST s ()
-rearrange c = do
+starZeros ::
+  CostMatrix s ->
+  MarkMatrix s ->
+  CoverageVector s ->
+  CoverageVector s ->
+  ST s ()
+starZeros c m aCoverage bCoverage = do
   ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds c
-  (aMarksList, bMarksList) <- optimalMarks c
-  aMarks <- asSTUArray (ST.newArray (aMinBound, aMaxBound) False)
-  bMarks <- asSTUArray (ST.newArray (bMinBound, bMaxBound) False)
-  forM_ aMarksList $ \i ->
-    ST.writeArray aMarks i True
-  forM_ bMarksList $ \j ->
-    ST.writeArray bMarks j True
-  minUnmarkedValueRef <- newSTRef maxBound
-  countFromTo aMinBound aMaxBound $ \i ->
-    countFromTo bMinBound bMaxBound $ \j -> do
-      aMarked <- ST.readArray aMarks i
-      bMarked <- ST.readArray bMarks j
-      unless (aMarked || bMarked) $
-        ST.readArray c (i, j) >>= modifySTRef' minUnmarkedValueRef . min
-  minUnmarkedValue <- readSTRef minUnmarkedValueRef
-  countFromTo aMinBound aMaxBound $ \i ->
-    countFromTo bMinBound bMaxBound $ \j -> do
-      aMarked <- ST.readArray aMarks i
-      bMarked <- ST.readArray bMarks j
-      if not aMarked && not bMarked
-        then ST.modifyArray c (i, j) (subtract minUnmarkedValue)
-        else
-          when (aMarked && bMarked) $
-            ST.modifyArray c (i, j) (+ minUnmarkedValue)
-{-# INLINEABLE rearrange #-}
-
--- | Return optimal marks in A and B respectively so that they cover all
--- zeros in the matrix.
-optimalMarks :: STUArray s (Int, Int) Int -> ST s ([Int], [Int])
-optimalMarks c = do
-  ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds c
-  zeroPositionsRef <- newSTRef []
   countFromTo aMinBound aMaxBound $ \i ->
     countFromTo bMinBound bMaxBound $ \j -> do
       x <- ST.readArray c (i, j)
-      when (x == 0) $
-        modifySTRef' zeroPositionsRef ((i, j) :)
-  marksFromZeroPositions <$> readSTRef zeroPositionsRef
-{-# INLINEABLE optimalMarks #-}
+      when (x == 0) $ do
+        aCovered <- ST.readArray aCoverage i
+        bCovered <- ST.readArray bCoverage j
+        when (not aCovered && not bCovered) $ do
+          ST.writeArray m (i, j) starMark
+          ST.writeArray aCoverage i True
+          ST.writeArray bCoverage j True
+  clearCoverage aCoverage bCoverage
+{-# INLINE starZeros #-}
 
--- | Convert zero positions into optimal marks.
-marksFromZeroPositions :: [(Int, Int)] -> ([Int], [Int])
-marksFromZeroPositions = go ([], []) (0 :: Int)
-  where
-    go results _ [] = results
-    go (aMarksSoFar, bMarksSoFar) markBalance xs =
-      let bestAMark = maximumLength (NonEmpty.groupAllWith fst xs)
-          bestBMark = maximumLength (NonEmpty.groupAllWith snd xs)
-          preferA = case length bestAMark `compare` length bestBMark of
-            LT -> False
-            EQ -> markBalance < 0
-            GT -> True
-       in if preferA
-            then
-              let aMark = fst (NonEmpty.head bestAMark)
-                  positionsToCover = filter ((/= aMark) . fst) xs
-               in go
-                    (aMark : aMarksSoFar, bMarksSoFar)
-                    (markBalance + 1)
-                    positionsToCover
-            else
-              let bMark = snd (NonEmpty.head bestBMark)
-                  positionsToCover = filter ((/= bMark) . snd) xs
-               in go
-                    (aMarksSoFar, bMark : bMarksSoFar)
-                    (markBalance - 1)
-                    positionsToCover
-    maximumLength = Data.List.maximumBy (compare `on` length)
+coverZeros ::
+  MarkMatrix s ->
+  CoverageVector s ->
+  CoverageVector s ->
+  ST s Bool
+coverZeros m _aCoverage bCoverage = do
+  ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds m
+  nRef <- newSTRef 0
+  countFromTo aMinBound aMaxBound $ \i ->
+    countFromTo bMinBound bMaxBound $ \j -> do
+      x <- ST.readArray m (i, j)
+      bCovered <- ST.readArray bCoverage j
+      when (x == starMark && not bCovered) $ do
+        ST.writeArray bCoverage j True
+        modifySTRef' nRef (+ 1)
+  n <- readSTRef nRef
+  return (n > aMaxBound)
+{-# INLINE coverZeros #-}
 
--- | Attempt assignment per elements of the first collection and return
--- pairs in the form of indices in the original collections. When assignment
--- is not possible 'Nothing' is returned.
-assignPerA ::
-  STUArray s (Int, Int) Int ->
-  ST s (Maybe [(Int, Int)])
-assignPerA c = do
+recoverResults ::
+  MarkMatrix s ->
+  Array Int a ->
+  Array Int b ->
+  ST s [(a, b)]
+recoverResults m as bs = do
+  ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds m
+  resultRef <- newSTRef []
+  countFromTo aMinBound aMaxBound $ \i ->
+    countFromTo bMinBound bMaxBound $ \j -> do
+      x <- ST.readArray m (i, j)
+      when (x == starMark) $ do
+        case (,) <$> (as A.!? i) <*> (bs A.!? j) of
+          Nothing -> return ()
+          Just (a, b) -> modifySTRef' resultRef ((a, b) :)
+  readSTRef resultRef
+{-# INLINE recoverResults #-}
+
+primeUncoveredZero ::
+  CostMatrix s ->
+  MarkMatrix s ->
+  CoverageVector s ->
+  CoverageVector s ->
+  ST s (Maybe (Int, Int))
+primeUncoveredZero c m aCoverage bCoverage = do
+  ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds m
+  primedRef <- newSTRef Nothing
+  void . countFromTo' aMinBound aMaxBound $ \i ->
+    countFromTo' bMinBound bMaxBound $ \j -> do
+      x <- ST.readArray c (i, j)
+      if x == 0
+        then do
+          aCovered <- ST.readArray aCoverage i
+          bCovered <- ST.readArray bCoverage j
+          if not aCovered && not bCovered
+            then False <$ writeSTRef primedRef (Just (i, j))
+            else return True
+        else return True
+  r <- readSTRef primedRef
+  case r of
+    Nothing -> return Nothing
+    Just (i, j) -> do
+      ST.writeArray m (i, j) primeMark
+      mj' <- findInA m starMark i
+      case mj' of
+        Nothing -> return (Just (i, j))
+        Just j' -> do
+          ST.writeArray aCoverage i True
+          ST.writeArray bCoverage j' False
+          primeUncoveredZero c m aCoverage bCoverage
+{-# INLINEABLE primeUncoveredZero #-}
+
+adjustMarks :: MarkMatrix s -> (Int, Int) -> ST s ()
+adjustMarks m z0 = do
+  ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds m
+  let go (_, j) acc = do
+        mi' <- findInB m starMark j
+        case mi' of
+          Nothing -> return acc
+          Just i' -> do
+            mj' <- findInA m primeMark i'
+            case mj' of
+              Nothing -> error "Data.Algorithm.Assignment.adjustMarks"
+              Just j' -> go (i', j') ((i', j) : (i', j') : acc)
+  path <- go z0 [z0]
+  forM_ path $ \(i, j) -> do
+    let adjust x =
+          if x == starMark
+            then noMark
+            else starMark
+    ST.modifyArray' m (i, j) adjust
+  countFromTo aMinBound aMaxBound $ \i ->
+    countFromTo bMinBound bMaxBound $ \j -> do
+      let resetPrime x =
+            if x == primeMark
+              then noMark
+              else x
+      ST.modifyArray' m (i, j) resetPrime
+{-# INLINE adjustMarks #-}
+
+adjustCosts ::
+  CostMatrix s ->
+  CoverageVector s ->
+  CoverageVector s ->
+  ST s ()
+adjustCosts c aCoverage bCoverage = do
   ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds c
-  let go zeroPositions i = do
-        let f recurse j =
-              if j > bMaxBound
-                then return Nothing
-                else do
-                  x <- ST.readArray c (i, j)
-                  if x == 0 && j `notElem` (snd <$> zeroPositions)
-                    then do
-                      m <- go ((i, j) : zeroPositions) (i + 1)
-                      case m of
-                        Nothing -> recurse (j + 1)
-                        Just r -> return (Just r)
-                    else recurse (j + 1)
-        if i > aMaxBound
-          then return (Just zeroPositions)
-          else fix f bMinBound
-  go [] aMinBound
-{-# INLINEABLE assignPerA #-}
+  minUncoveredValueRef <- newSTRef maxBound
+  countFromTo aMinBound aMaxBound $ \i ->
+    countFromTo bMinBound bMaxBound $ \j -> do
+      aCovered <- ST.readArray aCoverage i
+      bCovered <- ST.readArray bCoverage j
+      when (not aCovered && not bCovered) $ do
+        ST.readArray c (i, j) >>= modifySTRef' minUncoveredValueRef . min
+  minUncoveredValue <- readSTRef minUncoveredValueRef
+  countFromTo aMinBound aMaxBound $ \i ->
+    countFromTo bMinBound bMaxBound $ \j -> do
+      aCovered <- ST.readArray aCoverage i
+      bCovered <- ST.readArray bCoverage j
+      if not aCovered && not bCovered
+        then ST.modifyArray c (i, j) (subtract minUncoveredValue)
+        else
+          when (aCovered && bCovered) $
+            ST.modifyArray c (i, j) (+ minUncoveredValue)
+{-# INLINE adjustCosts #-}
 
--- | Attempt assignment per elements of the second collection and return
--- pairs in the form of indices in the original collections. When assignment
--- is not possible 'Nothing' is returned.
-assignPerB ::
-  STUArray s (Int, Int) Int ->
-  ST s (Maybe [(Int, Int)])
-assignPerB c = do
-  ((aMinBound, bMinBound), (aMaxBound, bMaxBound)) <- ST.getBounds c
-  let go zeroPositions j = do
-        let f recurse i =
-              if i > aMaxBound
-                then return Nothing
-                else do
-                  x <- ST.readArray c (i, j)
-                  if x == 0 && i `notElem` (fst <$> zeroPositions)
-                    then do
-                      m <- go ((i, j) : zeroPositions) (j + 1)
-                      case m of
-                        Nothing -> recurse (i + 1)
-                        Just r -> return (Just r)
-                    else recurse (i + 1)
-        if j > bMaxBound
-          then return (Just zeroPositions)
-          else fix f aMinBound
-  go [] bMinBound
-{-# INLINEABLE assignPerB #-}
+clearCoverage ::
+  CoverageVector s ->
+  CoverageVector s ->
+  ST s ()
+clearCoverage aCoverage bCoverage = do
+  let clearOne v = do
+        (from, to) <- ST.getBounds v
+        countFromTo from to $ \i ->
+          ST.writeArray v i False
+  clearOne aCoverage
+  clearOne bCoverage
+{-# INLINE clearCoverage #-}
 
--- | Transform an assignment expressed as pairs of indices into pairs of
--- elements of the actual collections.
-indicesToElems :: Array Int a -> Array Int b -> [(Int, Int)] -> [(a, b)]
-indicesToElems asArray bsArray = mapMaybe f
-  where
-    f (i, j) = (,) <$> (asArray A.!? i) <*> (bsArray A.!? j)
-{-# INLINE indicesToElems #-}
+findInA ::
+  MarkMatrix s ->
+  Char ->
+  Int ->
+  ST s (Maybe Int)
+findInA m mark i = do
+  ((_aMinBound, bMinBound), (_aMaxBound, bMaxBound)) <- ST.getBounds m
+  starredRef <- newSTRef Nothing
+  void . countFromTo' bMinBound bMaxBound $ \j -> do
+    x <- ST.readArray m (i, j)
+    if x == mark
+      then False <$ writeSTRef starredRef (Just j)
+      else return True
+  readSTRef starredRef
+{-# INLINE findInA #-}
+
+findInB ::
+  MarkMatrix s ->
+  Char ->
+  Int ->
+  ST s (Maybe Int)
+findInB m mark j = do
+  ((aMinBound, _bMinBound), (aMaxBound, _bMaxBound)) <- ST.getBounds m
+  starredRef <- newSTRef Nothing
+  void . countFromTo' aMinBound aMaxBound $ \i -> do
+    x <- ST.readArray m (i, j)
+    if x == mark
+      then False <$ writeSTRef starredRef (Just i)
+      else return True
+  readSTRef starredRef
+{-# INLINE findInB #-}
 
 countFromTo :: Int -> Int -> (Int -> ST s ()) -> ST s ()
 countFromTo start end action = go start
@@ -251,6 +310,18 @@ countFromTo start end action = go start
       go (n + 1)
 {-# INLINE countFromTo #-}
 
-asSTUArray :: ST s (STUArray s i a) -> ST s (STUArray s i a)
-asSTUArray = id
-{-# INLINE asSTUArray #-}
+countFromTo' :: Int -> Int -> (Int -> ST s Bool) -> ST s Bool
+countFromTo' start end action = go start
+  where
+    go !n =
+      if n <= end
+        then do
+          r <- action n
+          if r then go (n + 1) else return False
+        else return True
+{-# INLINE countFromTo' #-}
+
+noMark, starMark, primeMark :: Char
+noMark = 'n'
+starMark = 's'
+primeMark = 'p'

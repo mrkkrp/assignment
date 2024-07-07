@@ -1,7 +1,6 @@
 module Main (main) where
 
 import Data.Algorithm.Assignment (assign)
-import Data.List (sort)
 import Data.List qualified
 import Data.Tuple (swap)
 import Test.Hspec
@@ -40,23 +39,21 @@ spec = do
                      ("Dora", "Sweep floors")
                    ]
     it "always finds the best assignment" $
-      property $ \(Fun _ cost) (Short as) (Short bs) -> do
+      property $ \(Fun _ cost) (as :: [Int]) (bs :: [Int]) -> do
         let totalCost = sum . fmap cost
         forAll (shuffle bs) $ \bs' ->
           totalCost (assign (curry cost) as bs) <= totalCost (zip as bs')
-    it "swapping of the collections results in the same pairings" $
-      property $ \(Fun _ cost) (Short as) (Short bs) -> do
+    it "swapping of the collections results in pairings with the same total cost" $
+      property $ \(Fun _ cost) (as :: [Int]) (bs :: [Int]) -> do
         let cost0 = curry cost
             cost1 x y = cost0 y x
-        sort (assign cost0 as bs) == sort (swap <$> assign cost1 bs as)
-    it "shuffling of collections results in the same pairings" $
-      property $ \(Fun _ cost) (Short as) (Short bs) -> do
-        let cost' = curry cost
+            totalCost = sum . fmap cost
+        totalCost (assign cost0 as bs) == totalCost (swap <$> assign cost1 bs as)
+    it "shuffling of collections results in pairings with the same total cost" $
+      property $ \(Fun _ cost) (xs :: [(Int, Int)]) -> do
+        let totalCost = sum . fmap cost
+            cost' = curry cost
+            as = Data.List.nub (fst <$> xs)
+            bs = Data.List.nub (snd <$> xs)
         forAll (shuffle as) $ \as' ->
-          sort (assign cost' as bs) == sort (assign cost' as' bs)
-
-newtype Short = Short [Int]
-  deriving (Show)
-
-instance Arbitrary Short where
-  arbitrary = Short <$> scale (`div` 20) arbitrary
+          totalCost (assign cost' as bs) == totalCost (assign cost' as' bs)

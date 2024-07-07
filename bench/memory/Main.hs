@@ -13,8 +13,7 @@ main = mainWith $ do
   benchCase 10 20
   benchCase 20 10
   benchCase 20 20
-
--- benchCase 40 40
+  benchCase 40 40
 
 benchCase :: Int -> Int -> Weigh ()
 benchCase a b =
