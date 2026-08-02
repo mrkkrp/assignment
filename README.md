@@ -24,4 +24,4 @@ Pull requests are also welcome.
 
 Copyright © 2024–present Mark Karpov
 
-Distributed under BSD 3 clause license.
+Distributed under the BSD 3-clause license.

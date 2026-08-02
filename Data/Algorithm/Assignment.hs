@@ -30,10 +30,10 @@ type CoverageVector s = STUArray s Int Bool
 
 -- | \(\mathcal{O}(n^4)\). Assign elements from two collections to each
 -- other so that the total cost is minimal. The cost of each combination is
--- given the by the first argument and it can be negative. If any of the
+-- given by the first argument and it can be negative. If any of the
 -- collections is empty the result is the empty list. The sizes of the
--- collections need not to match. Finally, there is no guarantees on the
--- order of elements in the returned list of pairs.
+-- collections need not match. Finally, there are no guarantees on the order
+-- of elements in the returned list of pairs.
 --
 -- See: <https://en.wikipedia.org/wiki/Hungarian_algorithm#Matrix_interpretation>
 assign ::
